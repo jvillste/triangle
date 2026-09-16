@@ -1,13 +1,21 @@
 (ns triangle.core
   "A colored triangle in a native window, drawn with WebGPU: GLFW
   (through LWJGL) opens the window, libwgpu-native renders into it,
-  and triangle.ffi plus triangle.wgpu describe the C interop.
+  and triangle.ffi plus triangle.wgpu plus triangle.cocoa describe the
+  C interop. On macOS the window's content view gets a CAMetalLayer
+  first, because that is where Metal presents onto.
 
   Run with:  lein run            (a display is needed)
              lein run -- --smoke (headless plumbing check)
-             lein run -- --window-test (draw, screenshot, prove it)"
-  (:require [triangle.ffi :as ffi]
-            [triangle.wgpu :as wgpu])
+             lein run -- --window-test (draw, screenshot, prove it)
+  TRIANGLE_REPL_PORT=<port> ./run.sh additionally serves nREPL, so an
+  editor can connect to the live window process (see start-repl-server!)."
+  (:require [nrepl.server :as server]
+            [triangle.cocoa :as cocoa]
+            [triangle.ffi :as ffi]
+            [triangle.wgpu :as wgpu]
+            ;; the layout checks live next to the code they check
+            [clojure.test :refer [deftest is testing]])
   (:import [org.lwjgl.glfw GLFW GLFWNativeX11 GLFWNativeWayland]
            [java.awt GraphicsEnvironment Robot Rectangle]
            [java.io File]
@@ -35,30 +43,36 @@
     (= platform GLFW/GLFW_PLATFORM_WAYLAND) :wayland
     (= platform GLFW/GLFW_PLATFORM_X11) :x11
     (= platform GLFW/GLFW_PLATFORM_WIN32) :windows
+    (= platform GLFW/GLFW_PLATFORM_COCOA) :cocoa
     :else nil))
 
+(defn- surface-members
+  "The pointer members of this platform's chained struct, in struct
+  order (see triangle.wgpu/platform-descriptor!). Cocoa builds the
+  CAMetalLayer that WebGPU presents onto first; see triangle.cocoa."
+  [platform window]
+  (case platform
+    :wayland [(GLFWNativeWayland/glfwGetWaylandDisplay)
+              (GLFWNativeWayland/glfwGetWaylandWindow window)]
+    :x11 [(GLFWNativeX11/glfwGetX11Display)
+          (GLFWNativeX11/glfwGetX11Window window)]
+    :windows [(long 0) window]
+    :cocoa [(cocoa/metal-layer! window)]))
+
 (defn- make-surface!
-  "Create the wgpu-native surface that presents onto this native
-  window. The per-platform struct (32 bytes) is chained into
-  WGPUSurfaceDescriptor.nextInChain, exactly as shower.c does it.
-  On X11 the window is an XID passed by value (not a Window*); that
-  is why the handle crosses the FFM boundary as a raw long."
+  "Create the wgpu-native surface that presents onto this native window:
+  the per-platform struct chained into WGPUSurfaceDescriptor.nextInChain,
+  then the descriptor around it, then the surface, exactly as shower.c
+  does it. On X11 the window is an XID passed by value (not a Window*);
+  that is why the handles cross the FFM boundary as raw longs."
   [api instance window]
   (let [platform (window-platform (GLFW/glfwGetPlatform))]
     (when-not platform
       (throw (ex-info (str "no WebGPU surface wired for GLFW platform "
-                           (GLFW/glfwGetPlatform) " (X11, Wayland, Win32 are)")
+                           (GLFW/glfwGetPlatform) " (X11, Wayland, Win32 and Cocoa are)")
                       {:platform (GLFW/glfwGetPlatform)})))
-    (let [display (condp = platform
-                    :wayland (GLFWNativeWayland/glfwGetWaylandDisplay)
-                    :x11 (GLFWNativeX11/glfwGetX11Display)
-                    :windows (long 0))
-          handle (condp = platform
-                   :wayland (GLFWNativeWayland/glfwGetWaylandWindow window)
-                   :x11 (GLFWNativeX11/glfwGetX11Window window)
-                   :windows window)
-          platform-desc (wgpu/platform-descriptor! platform display handle)
-          surface-desc (wgpu/surface-descriptor! platform-desc)]
+    (let [chain (wgpu/platform-descriptor! platform (surface-members platform window))
+          surface-desc (wgpu/surface-descriptor! chain)]
       ((:create-surface api) instance surface-desc))))
 
 ;; ── adapter, device, pipeline plumbing
@@ -107,14 +121,19 @@
 
 (defn- build-graphics!
   "Everything WebGPU needs before the first triangle, from instance
-  on: first adapter, device, queue, shader module, render pipeline."
+  on: first adapter, device, queue, shader modules and both render
+  pipelines — the procedural one for the window loop and the
+  data-driven one for draw-triangles! from the REPL."
   [api instance]
   (let [adapter (first-adapter! api instance)
         device (request-device! api instance adapter)
         queue ((:get-queue api) device)
         shader (wgpu/create-triangle-shader! api device)
-        pipeline (wgpu/create-triangle-pipeline! api device shader)]
-    {:device device :queue queue :pipeline pipeline}))
+        pipeline (wgpu/create-triangle-pipeline! api device shader)
+        data-shader (wgpu/create-data-shader! api device)
+        data-pipeline (wgpu/create-data-pipeline! api device data-shader)]
+    {:device device :queue queue :pipeline pipeline
+     :pipeline-data data-pipeline}))
 
 ;; ── the render loop
 
@@ -133,9 +152,40 @@
           (wgpu/draw-triangle! api device queue surface pipeline)
           (recur))))))
 
+(defonce session
+  #_"The live window objects while a window is open: {:api :device :queue
+  :surface :pipeline :window}. Populated by run-window!, cleared when
+  it returns. REPL threads may read it and drive the WebGPU members
+  (draw frames, write buffers); the :window member is main-thread
+  business."
+  (atom nil))
+
+(defn request-frame!
+  "Wake the window loop so it repaints: glfwPostEmptyEvent is the one
+  GLFW call documented safe from any thread. No-op when no window is
+  open."
+  []
+  (when-let [window (:window @session)]
+    (GLFW/glfwPostEmptyEvent)))
+
+(defn draw-triangles!
+  "Draw triangles into the open window from the REPL: triangles is
+  either a flat seq of vertices — [x y r g b] or [x y r g b a], colors
+  0..1 floats or 0..255 integers — or a seq of triangles of three
+  vertices each. Positions are clip-space: x right, y up, -1..1. Each
+  call presents one frame; the next window event repaints the
+  procedural triangle over it."
+  [triangles]
+  (let [{:keys [api device queue surface pipeline-data]} @session]
+    (when-not (and api surface)
+      (throw (ex-info "no open window: start one with TRIANGLE_REPL_PORT=7888 ./run.sh" {})))
+    (wgpu/draw-triangles! api device queue surface pipeline-data triangles)))
+
 (defn- run-window!
   "Open the window, build the WebGPU objects, then repaint it once per
-  event. A swapchain that cannot deliver an image skips that repaint."
+  event. A swapchain that cannot deliver an image skips that repaint.
+  The live objects go into the session atom while the window is open,
+  so a connected editor can drive them (see session and request-frame!)."
   [api]
   (when-not (GLFW/glfwInit)
     (throw (ex-info "GLFW cannot connect to a display (no X11 or Wayland session?)" {})))
@@ -154,23 +204,28 @@
                           {:platform (GLFW/glfwGetPlatform)})))
         (let [graphics (build-graphics! api instance)
               _ ((:configure-surface api) surface
-                                          (wgpu/surface-configuration! (:device graphics) window-width window-height))]
+                                (wgpu/surface-configuration! (:device graphics) window-width window-height))]
+          (reset! session (assoc graphics :api api :window window :surface surface))
           (println (str "WebGPU pipeline ready (" window-width "x" window-height "); ESC quits"))
           (flush)
           (render-loop! api window surface graphics)))
       (finally
+        (reset! session nil)
         (GLFW/glfwDestroyWindow window)
         (GLFW/glfwTerminate)))))
 
 ;; ── self-test entry points
 
 (defn- window-test!
-  "Open the window, pump a dozen triangle frames, screenshot the
-  window and count colourful pixels. Exits nonzero when no triangle
-  appeared. Needs a display: test.sh runs this under xvfb-run."
+  "Open the window, pump a dozen triangle frames, screenshot the screen
+  at (0,0) and count colourful pixels, which shows the triangle only
+  when the window manager happened to put the window there. Needs a
+  display: test.sh runs this under Xvfb on Linux, and skips it on
+  macOS, where that capture would also need Screen Recording
+  permission."
   [api]
   (when (GraphicsEnvironment/isHeadless)
-    (throw (ex-info "no display: --window-test needs X11/Wayland (try xvfb-run)" {})))
+    (throw (ex-info "no display to draw on: --window-test needs X11 or Wayland (try ./test.sh)" {})))
   (when-not (GLFW/glfwInit)
     (throw (ex-info "glfwInit failed (no display?)" {})))
   (let [window (open-window!)]
@@ -185,7 +240,7 @@
         (throw (ex-info "wgpuInstanceCreateSurface returned no surface" {})))
       (let [graphics (build-graphics! api instance)
             _ ((:configure-surface api) surface
-                                        (wgpu/surface-configuration! (:device graphics) window-width window-height))]
+                              (wgpu/surface-configuration! (:device graphics) window-width window-height))]
         (dotimes [frame (int 12)]
           (wgpu/draw-triangle! api (:device graphics) (:queue graphics)
                                surface (:pipeline graphics))
@@ -220,15 +275,65 @@
             (do (println "window test: NO triangle (target/triangle.png)")
                 (System/exit 1))))))))
 
+;; ── embedded nREPL server (TRIANGLE_REPL_PORT)
+
+(defn repl-port
+  "Port for the embedded nREPL server, from the TRIANGLE_REPL_PORT
+  environment variable: nil when unset or not a number."
+  [value]
+  (when (string? value)
+    (parse-long value)))
+
+(deftest test-repl-port
+  (testing "a numeric variable selects a port, anything else none"
+    (is (= 7888 (repl-port "7888")))
+    (is (= 0 (repl-port "0")))
+    (is (nil? (repl-port nil)))
+    (is (nil? (repl-port "open sesame")))))
+
+(defn- message-handler
+  "The nREPL message handler for the embedded server: cider-nrepl's
+  middleware handler when that library is on the classpath (which
+  makes cider-connect work at full strength), the plain default
+  otherwise. cider.nrepl is loaded lazily, on the first connection
+  rather than at startup, because it initializes AWT — and AWT under
+  -XstartOnFirstThread only unblocks once the AppKit run loop has
+  started, which on macOS is glfwWaitEvents inside the window loop,
+  already running by then (JDK bug 8019496; see hello_lwjgl issue 6)."
+  []
+  (let [cider (delay
+                (try
+                  (require 'cider.nrepl)
+                  @(resolve 'cider.nrepl/cider-nrepl-handler)
+                  (catch Throwable _ nil)))]
+    (fn [message]
+      (if-let [handler @cider]
+        (handler message)
+        ((server/default-handler) message)))))
+
+(defn- start-repl-server!
+  "Start an nREPL server so an external editor (CIDER's
+  cider-connect, say) can evaluate against this live window process.
+  Evaluation happens on the server's worker threads: they may reach
+  WebGPU state, but never GLFW — on macOS only thread 0, which -main
+  and the window loop occupy, may do that."
+  [port]
+  (let [server (server/start-server :port port :handler (message-handler))]
+    (println "nREPL server on port" (:port server))
+    (flush)
+    server))
+
 ;; ── entry points
 
 (defn -main
-  "Entry point: --smoke runs the headless plumbing check, anything
-  else runs the triangle window (which needs a display)."
+  "Entry point: --smoke runs the headless plumbing check,
+  --window-test draws and screenshots, anything else runs the
+  triangle window (which needs a display). With TRIANGLE_REPL_PORT
+  set to a port, the window run also serves nREPL."
   [& args]
   (try
     (do
-      (ffi/load-library! (ffi/library-path))
+      (ffi/load-libraries!)
       (let [api (wgpu/make-api)]
         (cond
           (some #{"--smoke"} args)
@@ -239,15 +344,33 @@
 
           (some #{"--window-test"} args) (window-test! api)
 
-          :else (run-window! api))))
+          :else (let [port (repl-port (System/getenv "TRIANGLE_REPL_PORT"))
+                      repl-server (when port (start-repl-server! port))]
+                  (run-window! api)
+                  (when repl-server
+                    (server/stop-server repl-server))))))
     (catch Throwable failure
       (.printStackTrace failure)
       (println "triangle stopped:" (ex-message failure))
-      (println "headless machines have no window to show; try: lein run -- --smoke")
+      (println "if this machine has no display to draw on, check the plumbing instead with: lein run -- --smoke")
       (System/exit 1))))
 
-
+(defn clear! []
+  (draw-triangles! [[-1.0 -1.0 0 0 0]
+                    [-1.0 4.0 0 0 0]
+                    [4.0 -1.0 0 0 0]]))
 (comment
-  (ffi/load-library! (ffi/library-path))
+  (ffi/load-libraries!)
   (window-test! (wgpu/make-api))
+
+
+(do (clear!)
+    (draw-triangles! (apply concat
+                            (for [i (range 10)]
+                              [[(+ (* i 0.1)
+                                   -0.5)
+                                -0.5 255 0 0]
+                               [0.5 -0.5 0 255 0]
+                               [0.0 0.5 0 0 255]]))))
+
   ) ;; TODO: remove me

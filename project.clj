@@ -3,6 +3,12 @@
   :dependencies [[org.clojure/clojure "1.11.4"]
                  [org.lwjgl/lwjgl "3.3.6"]
                  [org.lwjgl/lwjgl-glfw "3.3.6"]
+                 ;; embedded nREPL server for connecting an editor to the
+                 ;; live window process (TRIANGLE_REPL_PORT)
+                 [nrepl/nrepl "1.7.0"]
+                 ;; optional middleware for the embedded nREPL server;
+                 ;; loaded lazily so CIDER connects at full strength
+                 [cider/cider-nrepl "0.62.2"]
                  ;; LWJGL native libraries (auto-extracted to a temp directory at runtime)
                  [org.lwjgl/lwjgl "3.3.6" :classifier "natives-linux"]
                  [org.lwjgl/lwjgl "3.3.6" :classifier "natives-linux-arm64"]

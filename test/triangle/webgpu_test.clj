@@ -8,10 +8,14 @@
 
 (deftest test-platform-descriptor!
   (testing "the per-platform surface chain struct"
-    (let [descriptor (wgpu/platform-descriptor! :x11 0x1000 0x2000)]
+    (let [descriptor (wgpu/platform-descriptor! :x11 [0x1000 0x2000])]
       (is (= 0x3 (ffi/deref-u32 descriptor 8)))
       (is (= 0x1000 (ffi/deref-pointer descriptor 16)))
-      (is (= 0x2000 (ffi/deref-pointer descriptor 24))))))
+      (is (= 0x2000 (ffi/deref-pointer descriptor 24)))))
+  (testing "Cocoa carries one member: the CAMetalLayer"
+    (let [descriptor (wgpu/platform-descriptor! :cocoa [0x1000])]
+      (is (= 0x1 (ffi/deref-u32 descriptor 8)))
+      (is (= 0x1000 (ffi/deref-pointer descriptor 16))))))
 
 (deftest test-surface-configuration!
   (testing "the surface configuration struct (56 bytes, v22 layout)"

@@ -1,33 +1,38 @@
 (ns triangle.ffi
   "Foreign Function Interface plumbing for calling libwgpu_native from
-  Clojure. This namespace knows nothing about WebGPU, only how to find
-  symbols in a native library and how to call them through the
-  java.lang.foreign (FFM) API. WebGPU knowledge lives in triangle.wgpu."
+  Clojure, plus the Objective-C runtime on macOS. This namespace knows
+  nothing about WebGPU, only how to find symbols in a native library
+  and how to call them through the java.lang.foreign (FFM) API.
+  WebGPU knowledge lives in triangle.wgpu, AppKit and Metal plumbing in
+  triangle.cocoa."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
   (:import [java.io File]
            [java.lang.foreign Arena MemorySegment ValueLayout]))
 
-(def ^:private library (atom {:lookup nil :functions {}}))
+(def ^:private library (atom {:lookups []}))
 
 (def layouts
-  "Keyword shorthand for the value layouts the WebGPU C ABI needs."
+  "Keyword shorthand for the value layouts the native C ABI needs.
+  Objective-C BOOLs are one byte, like C _Bool."
   {:ptr ValueLayout/ADDRESS
    :u32 ValueLayout/JAVA_INT
    :u64 ValueLayout/JAVA_LONG
-   :f64 ValueLayout/JAVA_DOUBLE})
+   :f64 ValueLayout/JAVA_DOUBLE
+   :u8 ValueLayout/JAVA_BYTE})
 
 (defn loaded?
-  "True when the native library has been loaded."
+  "True when a native library is in the symbol search."
   []
-  (boolean (:lookup @library)))
+  (not (zero? (count (:lookups @library)))))
 
 (defn load-library!
-  "dlopen the native library at path; later function calls resolve
-  symbols inside it. Returns the path loaded."
+  "dlopen the native library at path and add its symbols to the search
+  chain: later function calls resolve names in any library in the chain.
+  Returns the path loaded."
   [path]
-  (swap! library assoc :lookup (triangle.FFM/libraryLookup path (Arena/global))
-         :functions {})
+  (swap! library update :lookups
+         conj (triangle.FFM/libraryLookup path (Arena/global)))
   path)
 
 (defn pointer
@@ -72,6 +77,11 @@
 (defn write-f64!
   [^MemorySegment segment offset value]
   (triangle.FFM/putDouble segment (long offset) (double value)))
+
+(defn write-f32!
+  "Write a 4-byte float slot (vertex data, colors)."
+  [^MemorySegment segment offset value]
+  (triangle.FFM/putFloat segment (long offset) (double value)))
 
 (defn allocate!
   "Allocate zeroed native memory of size bytes, 8-byte aligned (the
@@ -126,8 +136,8 @@
 
 (defn library-path
   "Absolute path of libwgpu_native to dlopen: either the override
-  argument (normally the wgpu.library system property) or the copy
-  under resources/native/<platform>/ in the project directory."
+  argument (normally the wgpu.library system property) or the copy under
+  resources/native/<platform>/ in the project directory."
   ([]
    (library-path (System/getProperty "wgpu.library")))
   ([override]
@@ -139,31 +149,60 @@
                 (not-empty ^String override) override
                 (.isFile file) (.getAbsolutePath file)
                 :else nil)]
-     (if (and path (.isFile (File. path)))
+     (if (and path (.isFile (File. ^String path)))
        path
-       (throw (ex-info "wgpu-native library not found; set -Dwgpu.library or place the library under resources/native/<platform>/"
-                       {:searched [(str (File. (System/getProperty "user.dir") "resources/native"))
-                                   (str override)]}))))))
+       (throw (ex-info (str "wgpu-native library not found: nothing named "
+                            (library-file-name) " under " (.getPath directory)
+                            ", and no -Dwgpu.library override points at one")
+                       {:searched [(.getPath directory) (str override)]}))))))
+
+(defn runtime-path
+  "Path of the Objective-C runtime on macOS, or nil on any other system.
+  There is no libobjc to dlopen on Linux, and the one macOS ships is
+  spelled libobjc.A.dylib (the plain name is kept as a fallback)."
+  []
+  (when (re-find #"(?i)mac|darwin" (System/getProperty "os.name"))
+    (first (keep #(.isFile (File. ^String %))
+                 ["/usr/lib/libobjc.A.dylib"
+                  "/usr/lib/libobjc.dylib"]))))
+
+(defn load-libraries!
+  "Load the native libraries this machine needs in order to draw: the
+  WebGPU C library and, on macOS, the Objective-C runtime that
+  triangle.cocoa sends AppKit and Metal messages through. Called once
+  from triangle.core/-main, before anything looks a symbol up."
+  []
+  (load-library! (library-path))
+  (when-let [path (runtime-path)]
+    (load-library! path))
+  nil)
 
 (defn function
-  "Clojure function calling native function name. return and arguments
-  are layout keywords (:ptr :u32 :u64 :f64; nil means void). Call the
-  result with arguments in C order; nil pointers are NULL, :ptr slots
-  accept pointers via pointer, and :u32/:u64/:f64 slots are converted."
+  "Clojure function calling native function name, looked up in the
+  libraries loaded so far. return and arguments are layout keywords
+  (:ptr :u32 :u64 :f64 :u8; nil means void). Call the result with
+  arguments in C order; nil pointers are NULL, :ptr slots accept
+  pointers via pointer, and :u32/:u64/:f64/:u8 slots are converted.
+  objc_msgSend takes one selector in several shapes, so the same symbol
+  can need one handle per shape."
   [name return signature]
-  (let [handle (triangle.FFM/downcall
-                 (:lookup @library)
-                 name (layouts return) (into-array ValueLayout (mapv layouts signature)))]
+  (let [layout (layouts return)
+        layouts (into-array ValueLayout (mapv layouts signature))
+        handle (some #(triangle.FFM/downcall % name layout layouts)
+                     (:lookups @library))]
     (when (nil? handle)
-      (throw (ex-info (str "symbol not found in native library: " name)
+      (throw (ex-info (str "symbol not found in the loaded native libraries: "
+                           name)
                       {:function name})))
     (fn [& arguments]
-      (when-not (= (count signature) (count arguments)) (throw (ex-info (str "arity mismatch calling " name) {:function name})))
+      (when-not (= (count signature) (count arguments))
+        (throw (ex-info (str "arity mismatch calling " name) {:function name})))
       (triangle.FFM/call handle
                          (into-array Object
                                      (map (fn [slot argument]
                                             (case slot
                                               :ptr (pointer argument)
+                                              :u8 (byte argument)
                                               :u32 (int argument)
                                               :u64 (long argument)
                                               :f64 (double argument)
@@ -171,7 +210,9 @@
                                           signature arguments))))))
 
 (comment
-  ;; Manual smoke check, from the project directory with JDK 22:
-  ;; (load-library! "resources/native/linux-aarch64/libwgpu_native.so")
+  ;; Manual smoke check, from the project directory:
+  ;; (load-libraries!)
   ;; ((function "wgpuCreateInstance" :ptr [:ptr]) nil) => non-NULL MemorySegment
+  ;; ((function "objc_getClass" :ptr [:ptr]) nil) => on Linux this throws
+  ;; "symbol not found in the loaded native libraries", on macOS it is NULL.
   )

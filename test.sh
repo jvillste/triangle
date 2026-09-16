@@ -1,9 +1,10 @@
 #!/bin/sh
 # Compile everything, run the struct layout checks, then the headless
 # WebGPU smoke test (instance, adapter, device, shader module, render
-# pipeline) and finally the window test. Needs no display or GPU: on
-# headless Linux the window test opens its own Xvfb screen and draws
-# through llvmpipe software rendering.
+# pipeline) and finally the window test. On headless Linux the window
+# test opens its own Xvfb screen and draws through llvmpipe software
+# rendering; on macOS it is skipped, because the screenshot is an X11
+# thing (see README.md).
 set -e
 cd "$(dirname "$0")"
 
@@ -33,10 +34,13 @@ lein run -- --smoke
 
 echo
 echo "== window test (real window; under Xvfb when headless) =="
-if [ -n "$DISPLAY" ]; then
+if [ "$(uname)" = Darwin ]; then
+  echo "macOS: ./run.sh opens the window. The screenshot test needs X11:"
+  echo "it grabs the screen at (0,0), which is only the window when the"
+  echo "window manager puts it there, and macOS needs Screen Recording"
+  echo "permission for the capture to see past the desktop."
+elif [ -n "$DISPLAY" ]; then
   lein run -- --window-test
-elif [ "$(uname)" = Darwin ]; then
-  echo "macOS: ./run.sh opens the window (the screenshot test needs X11)"
 elif command -v Xvfb >/dev/null 2>&1; then
   Xvfb -ac :99 -screen 0 800x600x24 >/dev/null 2>&1 &
   XVPID=$!

@@ -155,6 +155,11 @@ public final class FFM {
         segment.set(ValueLayout.JAVA_DOUBLE, offset, value);
     }
 
+    /** Write one native float (4 bytes) at a byte offset. */
+    public static void putFloat(MemorySegment segment, long offset, double value) {
+        segment.set(ValueLayout.JAVA_FLOAT, offset, (float) value);
+    }
+
     /** Write one native pointer (8 bytes) at a byte offset; null means NULL. */
     public static void putPointer(MemorySegment segment, long offset, MemorySegment value) {
         segment.set(ValueLayout.ADDRESS, offset,

@@ -1,0 +1,10 @@
+target/
+profiles.clj
+.lein-repl-history
+.nrepl-port
+*.class
+/.DS_Store
+/.clj-kondo/
+/.java-version
+/.lein-failures
+/.lsp/

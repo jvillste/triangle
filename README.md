@@ -10,17 +10,20 @@ Foreign Function & Memory (FFM) API:
   startup (bundled copy under `resources/native/<platform>/`, or
   point `-Dwgpu.library=/path/to/libwgpu_native.so` at another one)
   and called through hand-written FFM bindings — no glue generators.
-  The bundled binaries come from the official wgpu-native v22.1.0.5
-  GitHub release zips (macOS, linux-x86_64) and from the `wn22`
-  source tree (linux-aarch64, windows-x86_64); all were built against
-  the same `webgpu.h`, which is what the struct layouts in
-  `triangle.wgpu` and the tests assume.
+  No native library lives in git: `./fetch-native.sh` downloads the
+  pinned official release artifact for this platform (sha256-checked)
+  into `resources/native/`, and `test.sh`/`run.sh` run it first. All
+  five artifacts are the official v22.1.0.5 release builds, made
+  against the same `webgpu.h` the struct layouts in `triangle.wgpu`
+  and the tests assume.
 - The triangle itself is procedural: a WGSL vertex shader builds
   three clip-space vertices from `vertex_index` and gives each a
   primary color; the hardware interpolates between them.
 
 ## Building and testing
 
+    ./fetch-native.sh           download this platform's libwgpu_native
+                                (add --all for every platform)
     ./test.sh                   compile, struct-layout checks, the
                                 headless smoke test, and the window
                                 test (under Xvfb when headless)
@@ -101,6 +104,16 @@ process - a Linux container with `DISPLAY` unset, say - the run is
 reported as "no display to draw on" rather than as a crash.
 
 ## Requirements
+
+Network access for the first build: ./fetch-native.sh (run by
+./test.sh and ./run.sh) downloads libwgpu_native from the wgpu-native
+GitHub release and checks its sha256 against the pinned value in the
+script. After that the check is local and offline. On macOS behind a
+Docker shared folder, run ./fetch-native.sh on the Mac itself — a
+dylib the container wrote into the mount can be served with stale
+pages and killed at dlopen (see the macOS section below). Windows is
+not scripted: fetch the wgpu-windows-x86_64-msvc-release.zip by hand
+and copy lib/wgpu_native.dll into resources/native/windows-x86_64/.
 
 JDK 25 is the pinned toolchain: ./test.sh and ./run.sh pick it up
 by themselves (Linux: apt's openjdk-25-jdk - ask for the FULL

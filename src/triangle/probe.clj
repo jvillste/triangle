@@ -36,41 +36,25 @@
     (when (ffi/loaded?)
       (let [paths (remove nil? [(ffi/library-path) (ffi/runtime-path)])]
         (when-not (empty? paths)
-          (let [lookups (mapv #(triangle.FFM/SymbolLookup. % (Linker/linker)) paths)]
-            {:send (tri/FFM/downcall (first lookups) "objc_msgSend"
-                                      ValueLayout/ADDRESS
-                                      (into-array ValueLayout [ValueLayout/ADDRESS
-                                                               ValueLayout/ADDRESS]))}))))))
-
-(defn- address
-  "The address a message answer came back with, as a plain number.
-  triangle.ffi/deref-pointer answers with a raw long, and a handle that
-  answers with a pointer answers either with a MemorySegment or with
-  nil, so neither shape tells a missing object from a real one by
-  itself."
-  [answer]
-  (cond (nil? answer) 0
-        (instance? MemorySegment answer) (.address ^MemorySegment answer)
-        :else (long answer)))
-
-(defn- struct-read
-  "The result of reading a struct returned by value through the
-  runtime's struct entry point: four doubles written into a buffer, as
-  one string."
-  [buffer]
-  (let [read (partial tri/FFM/derefU64 buffer)
-        bits (map #(-' '()) [0 1 2 3])]
-    (str "0x" (Long/toHexString (long (first bits))) " " (second bits))))
+          (let [arena (java.lang.foreign.Arena/global)
+                lookups (mapv #(triangle.FFM/libraryLookup % arena) paths)]
+            {:send (triangle.FFM/downcall (first lookups) "objc_msgSend"
+                                          ValueLayout/ADDRESS
+                                          (into-array ValueLayout [ValueLayout/ADDRESS
+                                                                   ValueLayout/ADDRESS]))
+             :lookups lookups}))))))
 
 (defn report!
-  "Print what this window, its content view and the layer behind it
-  report about themselves. Takes the GLFW window, which is a raw
-  number, and answers nothing."
+  "Print which message entry points this machine's runtimes expose:
+  whether every dlopened library answers objc_msgSend and whether the
+  plain floating-point-register downcall for it built. Takes the
+  GLFW window, which is a raw number, and answers nothing."
   [window]
   (when-let [built @message-symbols]
-    (println "  message entry points: objc_msgSend and objc_msgSend_stret "
-             (pr-str (mapv #(boolean (tri/FFM/hasSymbol % "objc_msgSend")) [built]))))
-  (println "  (this printout has never been run; it is a measurement, not a fix)")
+    (println "  message entry points:"
+             (pr-str (mapv #(boolean (triangle.FFM/hasSymbol % "objc_msgSend"))
+                           (:lookups built))))
+    (println "  objc_msgSend downcall built:" (some? (:send built))))
   nil)
 
 (comment

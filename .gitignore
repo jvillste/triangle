@@ -8,3 +8,4 @@ profiles.clj
 /.java-version
 /.lein-failures
 /.lsp/
+/resources/native/*/

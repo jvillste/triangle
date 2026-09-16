@@ -24,6 +24,10 @@ fi
 export JAVA_HOME
 export PATH="$JAVA_HOME/bin:$PATH"
 
+# No native libraries live in git: fetch this machine's libwgpu_native
+# from the pinned official release if it is missing or wrong.
+./fetch-native.sh
+
 echo "== lein javac + lein test (struct layout checks) =="
 lein javac
 lein test

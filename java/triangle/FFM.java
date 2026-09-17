@@ -10,8 +10,6 @@ import java.lang.foreign.StructLayout;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 
 /**
  * Small plumbing layer over the java.lang.foreign (FFM) API, written in
@@ -36,6 +34,19 @@ public final class FFM {
     /** True when the library exposes the given symbol. */
     public static boolean hasSymbol(SymbolLookup lookup, String name) {
         return lookup.find(name).isPresent();
+    }
+
+    /** Combine several lookups into one, searched in the given order. */
+    public static SymbolLookup combineLookup(java.util.List<SymbolLookup> lookups) {
+        java.util.Iterator<SymbolLookup> it = lookups.iterator();
+        if (!it.hasNext()) {
+            return SymbolLookup.loaderLookup();
+        }
+        SymbolLookup combined = it.next();
+        while (it.hasNext()) {
+            combined = combined.or(it.next());
+        }
+        return combined;
     }
 
     /**
@@ -65,49 +76,6 @@ public final class FFM {
             return handle.invokeWithArguments(args);
         } catch (Throwable failure) {
             throw new RuntimeException(failure);
-        }
-    }
-
-    /**
-     * Wrap a Clojure function (any clojure.lang.IFn) as a native function
-     * pointer usable as a WebGPU callback. The Clojure function is called
-     * with the callback arguments; pointer arguments arrive as
-     * MemorySegments.
-     */
-    public static MemorySegment callback(Object fn, MemoryLayout ret, MemoryLayout... args) {
-        try {
-            Class<?> ifn = Class.forName("clojure.lang.IFn");
-            FunctionDescriptor descriptor = (ret == null)
-                    ? FunctionDescriptor.ofVoid(args)
-                    : FunctionDescriptor.of(ret, args);
-            MethodType interfaceType = descriptor.toMethodType();
-            MethodHandle target = MethodHandles.publicLookup()
-                    .findVirtual(ifn, "invoke",
-                            MethodType.genericMethodType(args.length))
-                    .bindTo(fn);
-            if (interfaceType.returnType() == void.class) {
-                target = MethodHandles.filterReturnValue(target, IGNORE_RETURN);
-            }
-            target = target.asType(interfaceType);
-            return LINKER.upcallStub(target, descriptor, ARENA);
-        } catch (Throwable failure) {
-            throw new RuntimeException(failure);
-        }
-    }
-
-    /** Clojure functions return a value; void-returning callbacks drop it. */
-    public static void ignoreReturn(Object value) {
-    }
-
-    private static final MethodHandle IGNORE_RETURN;
-
-    static {
-        try {
-            IGNORE_RETURN = MethodHandles.publicLookup()
-                    .findStatic(FFM.class, "ignoreReturn",
-                            MethodType.methodType(void.class, Object.class));
-        } catch (NoSuchMethodException | IllegalAccessException failure) {
-            throw new ExceptionInInitializerError(failure);
         }
     }
 

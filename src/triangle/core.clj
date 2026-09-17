@@ -60,78 +60,32 @@
     :cocoa [(cocoa/metal-layer! window)]))
 
 (defn- make-surface!
-  "Create the wgpu-native surface that presents onto this native window:
-  the per-platform struct chained into WGPUSurfaceDescriptor.nextInChain,
-  then the descriptor around it, then the surface, exactly as shower.c
-  does it. On X11 the window is an XID passed by value (not a Window*);
-  that is why the handles cross the FFM boundary as raw longs."
-  [api instance window]
+  "Create the wgpu-native surface that presents onto this native window.
+  On X11 the window is an XID passed by value (not a Window*); that is
+  why the handles cross the FFM boundary as raw longs."
+  [instance window]
   (let [platform (window-platform (GLFW/glfwGetPlatform))]
     (when-not platform
       (throw (ex-info (str "no WebGPU surface wired for GLFW platform "
                            (GLFW/glfwGetPlatform) " (X11, Wayland, Win32 and Cocoa are)")
                       {:platform (GLFW/glfwGetPlatform)})))
-    (let [chain (wgpu/platform-descriptor! platform (surface-members platform window))
-          surface-desc (wgpu/surface-descriptor! chain)]
-      ((:create-surface api) instance surface-desc))))
+    (wgpu/create-surface! instance platform (surface-members platform window))))
 
 ;; ── adapter, device, pipeline plumbing
-
-(defn- first-adapter!
-  "Enumerate adapters (count, then fill) and return the first handle.
-  This is a wgpu-native extension call, not core WebGPU."
-  [api instance]
-  (let [count ((:enumerate-adapters api) instance nil nil)]
-    (when (zero? (long count))
-      (throw (ex-info "WebGPU enumerated no adapters (missing or headless GPU driver?)"
-                      {:adapter-count (long count)})))
-    (let [adapters (ffi/pointer-array! (int (min 8 (long count))))
-          _ ((:enumerate-adapters api) instance nil adapters)
-          adapter (ffi/deref-pointer adapters 0)]
-      (when-not adapter
-        (throw (ex-info "the second wgpuInstanceEnumerateAdapters call filled no slot" {})))
-      adapter)))
-
-(defn- request-device!
-  "Request a device on an adapter. The request is asynchronous: the
-  callback resolves a promise, and we wait up to about two seconds for
-  it. wgpu-native's processEvents is an unimplemented!() trap under
-  X11 (a non-unwinding Rust abort), so we never call it."
-  [api instance adapter]
-  (let [device-request (promise)
-        callback (ffi/callback!
-                  (fn [status device _message _userdata]
-                    (deliver device-request {:status (long status)
-                                             :device device}))
-                  [:u32 :ptr :ptr :ptr])
-        _ ((:request-device api) adapter nil callback nil)
-        settled (loop [spins (int 0)]
-                  (if (or (realized? device-request) (>= spins 1250))
-                    (when (realized? device-request) @device-request)
-                    (do (Thread/sleep 2)
-                        (recur (inc spins)))))]
-    (cond
-      (nil? settled) (throw (ex-info
-                             "device request timed out (no GPU driver to answer?)" {}))
-      (not= 0 (:status settled)) (throw (ex-info
-                                         (str "wgpuAdapterRequestDevice failed, status "
-                                              (:status settled) " (0 means Success)")
-                                         {:status (:status settled)}))
-      :else (:device settled))))
 
 (defn- build-graphics!
   "Everything WebGPU needs before the first triangle, from instance
   on: first adapter, device, queue, shader modules and both render
   pipelines — the procedural one for the window loop and the
   data-driven one for draw-triangles! from the REPL."
-  [api instance]
-  (let [adapter (first-adapter! api instance)
-        device (request-device! api instance adapter)
-        queue ((:get-queue api) device)
-        shader (wgpu/create-triangle-shader! api device)
-        pipeline (wgpu/create-triangle-pipeline! api device shader)
-        data-shader (wgpu/create-data-shader! api device)
-        data-pipeline (wgpu/create-data-pipeline! api device data-shader)]
+  [instance]
+  (let [adapter (wgpu/first-adapter! instance)
+        device (wgpu/request-device! adapter)
+        queue (wgpu/get-queue device)
+        shader (wgpu/create-shader-module! device wgpu/triangle-wgsl)
+        pipeline (wgpu/create-triangle-pipeline! device shader)
+        data-shader (wgpu/create-shader-module! device wgpu/data-triangle-wgsl)
+        data-pipeline (wgpu/create-data-pipeline! device data-shader)]
     {:device device :queue queue :pipeline pipeline
      :pipeline-data data-pipeline}))
 
@@ -142,18 +96,18 @@
   glfwWaitEvents sleeps until an event arrives, so an idle window
   costs no GPU time; ESC or the window manager close button ends the
   loop."
-  [api window surface graphics]
+  [window surface graphics]
   (let [{:keys [device queue pipeline]} graphics]
-    (wgpu/draw-triangle! api device queue surface pipeline)
+    (wgpu/draw-triangle! device queue surface pipeline)
     (loop []
       (GLFW/glfwWaitEvents)
       (when-not (GLFW/glfwWindowShouldClose window)
         (when-not (= GLFW/GLFW_PRESS (GLFW/glfwGetKey window GLFW/GLFW_KEY_ESCAPE))
-          (wgpu/draw-triangle! api device queue surface pipeline)
+          (wgpu/draw-triangle! device queue surface pipeline)
           (recur))))))
 
 (defonce session
-  #_"The live window objects while a window is open: {:api :device :queue
+  #_"The live window objects while a window is open: {:device :queue
   :surface :pipeline :window}. Populated by run-window!, cleared when
   it returns. REPL threads may read it and drive the WebGPU members
   (draw frames, write buffers); the :window member is main-thread
@@ -165,7 +119,7 @@
   GLFW call documented safe from any thread. No-op when no window is
   open."
   []
-  (when-let [window (:window @session)]
+  (when (:window @session)
     (GLFW/glfwPostEmptyEvent)))
 
 (defn draw-triangles!
@@ -176,17 +130,17 @@
   call presents one frame; the next window event repaints the
   procedural triangle over it."
   [triangles]
-  (let [{:keys [api device queue surface pipeline-data]} @session]
-    (when-not (and api surface)
+  (let [{:keys [device queue surface pipeline-data]} @session]
+    (when-not surface
       (throw (ex-info "no open window: start one with TRIANGLE_REPL_PORT=7888 ./run.sh" {})))
-    (wgpu/draw-triangles! api device queue surface pipeline-data triangles)))
+    (wgpu/draw-triangles! device queue surface pipeline-data triangles)))
 
 (defn- run-window!
   "Open the window, build the WebGPU objects, then repaint it once per
   event. A swapchain that cannot deliver an image skips that repaint.
   The live objects go into the session atom while the window is open,
   so a connected editor can drive them (see session and request-frame!)."
-  [api]
+  []
   (when-not (GLFW/glfwInit)
     (throw (ex-info "GLFW cannot connect to a display (no X11 or Wayland session?)" {})))
   (let [window (open-window!)]
@@ -195,20 +149,19 @@
       (throw (ex-info "glfwCreateWindow failed (no display?)" {})))
     (try
       (GLFW/glfwShowWindow window)
-      (let [instance ((:create-instance api) nil)
+      (let [instance (wgpu/create-instance!)
             _ (do (Thread/sleep 60)
                   (println "instance created."))
-            surface (make-surface! api instance window)]
+            surface (make-surface! instance window)]
         (when-not surface
           (throw (ex-info "wgpuInstanceCreateSurface returned no surface (display server too old?)"
                           {:platform (GLFW/glfwGetPlatform)})))
-        (let [graphics (build-graphics! api instance)
-              _ ((:configure-surface api) surface
-                                (wgpu/surface-configuration! (:device graphics) window-width window-height))]
-          (reset! session (assoc graphics :api api :window window :surface surface))
+        (let [graphics (build-graphics! instance)
+              _ (wgpu/configure-surface! surface (:device graphics) window-width window-height)]
+          (reset! session (assoc graphics :window window :surface surface))
           (println (str "WebGPU pipeline ready (" window-width "x" window-height "); ESC quits"))
           (flush)
-          (render-loop! api window surface graphics)))
+          (render-loop! window surface graphics)))
       (finally
         (reset! session nil)
         (GLFW/glfwDestroyWindow window)
@@ -223,7 +176,7 @@
   display: test.sh runs this under Xvfb on Linux, and skips it on
   macOS, where that capture would also need Screen Recording
   permission."
-  [api]
+  []
   (when (GraphicsEnvironment/isHeadless)
     (throw (ex-info "no display to draw on: --window-test needs X11 or Wayland (try ./test.sh)" {})))
   (when-not (GLFW/glfwInit)
@@ -233,47 +186,54 @@
       (throw (ex-info "glfwCreateWindow failed (no display?)" {})))
     (GLFW/glfwShowWindow window)
     (Thread/sleep (int 300))
-    (let [instance ((:create-instance api) nil)
+    (let [instance (wgpu/create-instance!)
           _ (Thread/sleep (int 60))
-          surface (make-surface! api instance window)]
+          surface (make-surface! instance window)]
       (when-not surface
         (throw (ex-info "wgpuInstanceCreateSurface returned no surface" {})))
-      (let [graphics (build-graphics! api instance)
-            _ ((:configure-surface api) surface
-                              (wgpu/surface-configuration! (:device graphics) window-width window-height))]
-        (dotimes [frame (int 12)]
-          (wgpu/draw-triangle! api (:device graphics) (:queue graphics)
+      (let [graphics (build-graphics! instance)
+            _ (wgpu/configure-surface! surface (:device graphics) window-width window-height)]
+        (dotimes [_ (int 12)]
+          (wgpu/draw-triangle! (:device graphics) (:queue graphics)
                                surface (:pipeline graphics))
           (Thread/sleep (int 60)))
-        (let [robot (Robot.)
-              shot (.createScreenCapture ^Robot robot
-                                         (Rectangle. (int 0) (int 0) (int window-width) (int window-height)))
-              classify (fn [rgb]
-                         (let [red (bit-and (bit-shift-right rgb 16) 0xFF)
-                               green (bit-and (bit-shift-right rgb 8) 0xFF)
-                               blue (bit-and rgb 0xFF)]
-                           (cond
-                             (and (> blue (int 130)) (< red (int 90)) (< green (int 90))) :blueish
-                             (and (> green (int 130)) (< red (int 90)) (< blue (int 90))) :greenish
-                             (and (> red (int 130)) (> green (int 90))) :red-yellowish
-                             (and (< (abs (- red green)) (int 26))
-                                  (< (abs (- green blue)) (int 26))) :greyish
-                             :else :unknown)))
-              classes (frequencies
-                       (for [y (range (int 0) (int window-height) (int 2))
-                             x (range (int 0) (int window-width) (int 2))]
-                         (classify (.getRGB ^BufferedImage shot (int x) (int y)))))
-              samples (quot (* window-width window-height) (int 4))
-              colourful (- (long samples)
-                           (long (classes :greyish (long 0)))
-                           (long (classes :unknown (long 0))))]
-          (ImageIO/write shot "png" (File. "target/triangle.png"))
-          (println (str "window test: " colourful " colourful of " samples " sampled pixels"))
-          (if (>= colourful (quot samples (int 100)))
-            (do (println "window test: triangle visible (target/triangle.png)")
-                (System/exit 0))
-            (do (println "window test: NO triangle (target/triangle.png)")
-                (System/exit 1))))))))
+        ;; the data-driven pipeline too: buffer-descriptor!,
+        ;; queue-write-buffer and set-vertex-buffer all validate
+        ;; the buffer's usage flags
+        (wgpu/draw-triangles! (:device graphics) (:queue graphics)
+                              surface (:pipeline-data graphics)
+                              [[-0.5 -0.5 255 0 0]
+                               [0.5 -0.5 0 255 0]
+                               [0.0 0.5 0 0 255]]))
+      (let [robot (Robot.)
+            shot (.createScreenCapture ^Robot robot
+                                       (Rectangle. (int 0) (int 0) (int window-width) (int window-height)))
+            classify (fn [rgb]
+                       (let [red (bit-and (bit-shift-right rgb 16) 0xFF)
+                             green (bit-and (bit-shift-right rgb 8) 0xFF)
+                             blue (bit-and rgb 0xFF)]
+                         (cond
+                           (and (> blue (int 130)) (< red (int 90)) (< green (int 90))) :blueish
+                           (and (> green (int 130)) (< red (int 90)) (< blue (int 90))) :greenish
+                           (and (> red (int 130)) (> green (int 90))) :red-yellowish
+                           (and (< (abs (- red green)) (int 26))
+                                (< (abs (- green blue)) (int 26))) :greyish
+                           :else :unknown)))
+            classes (frequencies
+                     (for [y (range (int 0) (int window-height) (int 2))
+                           x (range (int 0) (int window-width) (int 2))]
+                       (classify (.getRGB ^BufferedImage shot (int x) (int y)))))
+            samples (quot (* window-width window-height) (int 4))
+            colourful (- (long samples)
+                         (long (classes :greyish (long 0)))
+                         (long (classes :unknown (long 0))))]
+        (ImageIO/write shot "png" (File. "target/triangle.png"))
+        (println (str "window test: " colourful " colourful of " samples " sampled pixels"))
+        (if (>= colourful (quot samples (int 100)))
+          (do (println "window test: triangle visible (target/triangle.png)")
+              (System/exit 0))
+          (do (println "window test: NO triangle (target/triangle.png)")
+              (System/exit 1)))))))
 
 ;; ── embedded nREPL server (TRIANGLE_REPL_PORT)
 
@@ -332,23 +292,26 @@
   set to a port, the window run also serves nREPL."
   [& args]
   (try
-    (do
-      (ffi/load-libraries!)
-      (let [api (wgpu/make-api)]
-        (cond
-          (some #{"--smoke"} args)
-          (let [instance ((:create-instance api) nil)]
-            (build-graphics! api instance)
-            (println "smoke: FFM, adapter, device, WGSL shader and pipeline OK.")
-            (System/exit 0))
+    (ffi/load-libraries!)
+    (cond
+      (some #{"--smoke"} args)
+      (let [instance (wgpu/create-instance!)]
+        (build-graphics! instance)
+        (println "smoke: FFM, adapter, device, WGSL shader and pipeline OK.")
+        (System/exit 0))
 
-          (some #{"--window-test"} args) (window-test! api)
+      (some #{"--window-test"} args) (window-test!)
 
-          :else (let [port (repl-port (System/getenv "TRIANGLE_REPL_PORT"))
-                      repl-server (when port (start-repl-server! port))]
-                  (run-window! api)
-                  (when repl-server
-                    (server/stop-server repl-server))))))
+      :else (let [port (repl-port (System/getenv "TRIANGLE_REPL_PORT"))
+                  repl-server (when port (start-repl-server! port))]
+              (.start (Thread. (fn []
+                                 (Thread/sleep 2000)
+                                 (draw-triangles! [[-1.0 -1.0 0 0 0]
+                                                   [-1.0 4.0 0 0 0]
+                                                   [4.0 -1.0 0 0 0]]))))
+              (run-window!)
+              (when repl-server
+                (server/stop-server repl-server))))
     (catch Throwable failure
       (.printStackTrace failure)
       (println "triangle stopped:" (ex-message failure))
@@ -361,16 +324,16 @@
                     [4.0 -1.0 0 0 0]]))
 (comment
   (ffi/load-libraries!)
-  (window-test! (wgpu/make-api))
+  (window-test!)
 
 
-(do (clear!)
-    (draw-triangles! (apply concat
-                            (for [i (range 10)]
-                              [[(+ (* i 0.1)
-                                   -0.5)
-                                -0.5 255 0 0]
-                               [0.5 -0.5 0 255 0]
-                               [0.0 0.5 0 0 255]]))))
+  (do (clear!)
+      (draw-triangles! (apply concat
+                              (for [i (range 10)]
+                                [[(+ (* i 0.1)
+                                     -0.5)
+                                  -0.5 255 0 0]
+                                 [0.5 -0.5 0 255 0]
+                                 [0.0 0.5 0 0 255]]))))
 
   ) ;; TODO: remove me

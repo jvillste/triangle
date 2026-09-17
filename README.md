@@ -9,13 +9,15 @@ Foreign Function & Memory (FFM) API:
 - **libwgpu-native 22.1.0.5** does the rendering. It is dlopened at
   startup (bundled copy under `resources/native/<platform>/`, or
   point `-Dwgpu.library=/path/to/libwgpu_native.so` at another one)
-  and called through hand-written FFM bindings — no glue generators.
+  and called through the full wgpu-native bindings jextract
+  generated from that release's C header: `java/wgpu/` is the
+  generated tree, and `./regenerate-bindings.sh` makes it again.
   No native library lives in git: `./fetch-native.sh` downloads the
   pinned official release artifact for this platform (sha256-checked)
   into `resources/native/`, and `test.sh`/`run.sh` run it first. All
   five artifacts are the official v22.1.0.5 release builds, made
-  against the same `webgpu.h` the struct layouts in `triangle.wgpu`
-  and the tests assume.
+  against the same `webgpu.h` the generated layouts and the tests
+  assume.
 - The triangle itself is procedural: a WGSL vertex shader builds
   three clip-space vertices from `vertex_index` and gives each a
   primary color; the hardware interpolates between them.
@@ -62,8 +64,8 @@ already runs it:
 What the REPL may and may not do:
 
 - `triangle.core/session` holds the live objects while the window is
-  open: `{:api :device :queue :surface :pipeline :pipeline-data
-  :window}`. Take handles from it; a null or stale handle does not
+  open: `{:device :queue :surface :pipeline :pipeline-data :window}`.
+  Take handles from it; a null or stale handle does not
   throw, it aborts the whole process (Rust panics do not unwind into
   the JVM).
 - WebGPU calls are thread-safe: draw frames, write buffers and build
@@ -93,10 +95,11 @@ triangles of three vertices each. Each call uploads a vertex buffer,
 presents one frame and releases everything it created; the next
 window event repaints the procedural triangle over it.
 
-Lower level: `triangle.wgpu` exposes `:create-buffer`,
-`:queue-write-buffer` and `:release-buffer` for uploading data of
-your own, and `:create-data-pipeline!` builds the pipeline that reads
-positions (float32x2) and colors (float32x4) from a vertex buffer.
+Lower level: the generated bindings expose every entry point of the
+header as a static on `wgpu.wgpu_h`, and `triangle.wgpu` adds the
+demo-side builders (`buffer-descriptor!`, `vertex-buffer-layout!`)
+and `create-data-pipeline!`, the pipeline that reads positions
+(float32x2) and colors (float32x4) from a vertex buffer.
 GLFW also has to *reach* a display server, and `triangle.core` only
 knows the four windowing systems WebGPU has a surface backend for:
 X11, Wayland, Win32 and Cocoa. With none of them in front of the
@@ -123,6 +126,13 @@ java.awt.Robot could never screenshot anything there. macOS:
 project.clj adds -XstartOnFirstThread on macOS only: Cocoa wants
 AppKit on the first thread, while Linux HotSpot does not even know
 that flag and refuses to start a JVM when it sees it.
+
+jextract, which made java/wgpu/, ships as an early-access build,
+not with the JDK: only ./regenerate-bindings.sh needs it (run that
+when the header revision changes), and it downloads the pinned EA
+build itself unless a jextract is on PATH. It reads the header
+from a wgpu-native checkout (WGPU_NATIVE_DIR, or a sibling "wn22"
+directory) matching the pinned release.
 
 A Vulkan driver, and software rendering is enough. Window mode and
 the window test need a display: a real X11/Wayland session, or
@@ -163,10 +173,21 @@ window test needs X11, and `./run.sh` opens the window.
 
 ## How the pieces talk
 
-Clojure calls are built as `MethodHandle`s over `Linker.downcallHandle`
-(see `triangle.ffi/function`). Pointer-sized arguments are marshalled
-as `MemorySegment`s — the FFM linker rejects raw `long`s there. Two
-APIs are deliberately never called: `wgpuInstanceProcessEvents` (in
+The WebGPU side is a generated boundary: `java/wgpu/` is the full
+jextract output for `webgpu.h` plus the wgpu-native extensions in
+`wgpu.h`, so every struct layout and every entry point of the C API
+exists as Java, and the demo never writes a byte offset by hand.
+`triangle.wgpu` allocates each struct with the layout jextract
+derived and fills it through the generated per-field setters.
+jextract's own `SYMBOL_LOOKUP` would dlopen `libwgpu_native` by bare
+name at class init; the one hand-maintained line in `wgpu_h.java`
+(kept in step by `./regenerate-bindings.sh`) points it at
+`triangle.WgpuSymbols` instead, which `triangle.ffi/load-libraries!`
+registers against the library it dlopened — deferred, so the lookup
+answers at call time, when the right library is in. Every entry
+point is a `MethodHandle` downcall, and pointer-sized arguments are
+marshalled as `MemorySegment`s — the FFM linker rejects raw `long`s
+there. Two APIs are deliberately never called: `wgpuInstanceProcessEvents` (in
 wgpu-native v22 it is an `unimplemented!()` trap which panics and
 aborts the whole process under X11) and `glfwGetFramebufferSize`
 (this LWJGL aarch64 native build segfaults in it — the window is
@@ -174,20 +195,32 @@ fixed-size, so its size is simply known).
 
 ## Layout
 
-    java/triangle/FFM.java        the whole native boundary: symbol
-                                  lookup, downcall handles, callback
-                                  (upcall) stubs, memory helpers
-    src/triangle/ffi.clj          Clojure side of the boundary: find
-                                  symbols, build call handles, coerce
-                                  arguments (pointers must cross as
-                                  MemorySegments, not raw longs)
-    src/triangle/wgpu.clj         WebGPU knowledge: function
-                                  signatures, C struct layouts,
-                                  the WGSL shader, one frame's
-                                  worth of calls
+    java/wgpu/                    jextract-generated bindings for
+                                  the full wgpu-native 22.1.0.5 C
+                                  API (webgpu.h plus wgpu.h's
+                                  extensions); the one hand-maintained
+                                  line is SYMBOL_LOOKUP in wgpu_h.java
+    java/triangle/FFM.java        shared native plumbing: symbol
+                                  lookup, downcall handles, memory
+                                  helpers (still the whole boundary
+                                  for the macOS Objective-C messages)
+    java/triangle/WgpuSymbols.java  the symbol lookup the generated
+                                  bindings bind against: defers to
+                                  whatever triangle.ffi dlopened
+    src/triangle/ffi.clj          dlopen the libraries, keep the
+                                  symbol chain, register it with the
+                                  bindings, generic FFM helpers
+                                  (pointers cross as MemorySegments,
+                                  not raw longs)
+    src/triangle/wgpu.clj         the demo on the bindings: the
+                                  descriptor builders, the WGSL
+                                  shaders, one frame's worth of
+                                  calls
     src/triangle/core.clj         GLFW window, frame loop, self-tests
     src/triangle/cocoa.clj        macOS only: the CAMetalLayer the
                                   window presents onto, sent as
                                   Objective-C messages
-    test/triangle/webgpu_test.clj struct-layout checks (lein test)
+    test/triangle/webgpu_test.clj layout checks of the generated
+                                  structs and the demo's builders
+                                  (lein test)
     resources/native/<platform>/  libwgpu_native to dlopen

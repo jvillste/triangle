@@ -1,10 +1,21 @@
 (ns triangle.webgpu-test
-  "Layout checks for the struct builders. These need no GPU and no
-  window: they only inspect the byte layout of the descriptor
-  buffers, so \"lein test\" runs them anywhere the JDK runs."
+  "Layout checks for the struct builders and the jextract layouts
+  behind them. These need no GPU and no window: they only inspect the
+  byte layout of the descriptor buffers, so \"lein test\" runs them
+  anywhere the JDK runs."
   (:require [clojure.test :refer [deftest is testing]]
             [triangle.ffi :as ffi]
-            [triangle.wgpu :as wgpu]))
+            [triangle.wgpu :as wgpu])
+  (:import [wgpu WGPURenderPassColorAttachment WGPURenderPipelineDescriptor
+            WGPUSurfaceConfiguration]))
+
+(deftest test-generated-layouts
+  (testing "jextract derived the v22.1.0.5 byte layout from the header"
+    (is (= 56 (WGPUSurfaceConfiguration/sizeof)))
+    (is (= 8 (WGPUSurfaceConfiguration/device$offset)))
+    (is (= 44 (WGPUSurfaceConfiguration/width$offset)))
+    (is (= 72 (WGPURenderPassColorAttachment/sizeof)))
+    (is (= 144 (WGPURenderPipelineDescriptor/sizeof)))))
 
 (deftest test-platform-descriptor!
   (testing "the per-platform surface chain struct"
@@ -28,10 +39,10 @@
       (is (= 0 (ffi/deref-u32 configuration 52))))))
 
 (deftest test-color-target-state!
-  (testing "the colour target struct (format at 8, writeMask at 24)")
-  (let [target (wgpu/color-target-state!)]
-    (is (= 0x18 (ffi/deref-u32 target 8)))
-    (is (= 0xF (ffi/deref-u32 target 24)))))
+  (testing "the colour target struct (format at 8, writeMask at 24)"
+    (let [target (wgpu/color-target-state!)]
+      (is (= 0x18 (ffi/deref-u32 target 8)))
+      (is (= 0xF (ffi/deref-u32 target 24))))))
 
 (deftest test-render-pipeline-descriptor!
   (testing "the flat 144-byte pipeline descriptor (states embedded by value)"
@@ -40,9 +51,10 @@
           pipeline (wgpu/render-pipeline-descriptor! shader fragment)]
       (is (some? (ffi/deref-pointer pipeline 32)))    ; vertex.module
       (is (some? (ffi/deref-pointer pipeline 40)))    ; vertex.entryPoint
-      (is (some? (ffi/deref-pointer pipeline 136)))   ; fragment
+      (is (= 0 (ffi/deref-u32 pipeline 56)))          ; vertex.bufferCount
       (is (= 3 (ffi/deref-u32 pipeline 88)))          ; primitive.topology
       (is (= 1 (ffi/deref-u32 pipeline 120)))         ; multisample.count
       ;; 0xFFFFFFFF does not fit an int; stored as a Java int this reads
       ;; back as -1, which is the same 32 bits.
-      (is (= -1 (ffi/deref-u32 pipeline 124))))))    ; multisample.mask
+      (is (= -1 (ffi/deref-u32 pipeline 124)))        ; multisample.mask
+      (is (some? (ffi/deref-pointer pipeline 136)))))) ; fragment

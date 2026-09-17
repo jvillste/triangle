@@ -26,13 +26,22 @@
   []
   (not (zero? (count (:lookups @library)))))
 
+(defn lookup
+  "A single SymbolLookup over the libraries loaded so far, in load order.
+  The jextract-generated bindings in java/wgpu bind their function
+  symbols against this (via triangle.WgpuSymbols)."
+  []
+  (triangle.FFM/combineLookup (:lookups @library)))
+
 (defn load-library!
   "dlopen the native library at path and add its symbols to the search
   chain: later function calls resolve names in any library in the chain.
+  Also hands the combined lookup to the jextract-generated bindings.
   Returns the path loaded."
   [path]
   (swap! library update :lookups
          conj (triangle.FFM/libraryLookup path (Arena/global)))
+  (triangle.WgpuSymbols/registerLookup (lookup))
   path)
 
 (defn pointer
@@ -96,12 +105,6 @@
     (doto (.allocate (Arena/global) (long bytes) (long 1))
       (.setString 0 s))))
 
-(defn callback!
-  "Wrap f as a native function pointer (a WGPU callback). arguments are
-  the parameter layout keywords of that callback typedef."
-  [f arguments]
-  (triangle.FFM/callback f nil
-                         (into-array ValueLayout (mapv layouts arguments))))
 
 (defn write-u64!
   "Write an 8-byte slot (u64 members such as counts, or raw handles)."

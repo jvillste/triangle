@@ -9,3 +9,4 @@ profiles.clj
 /.lein-failures
 /.lsp/
 /resources/native/*/
+/java/wgpu/

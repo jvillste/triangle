@@ -61,7 +61,6 @@
   ;; To use it, on the Mac, after a rebuild:
   ;; (require 'triangle.probe)
   ;; (triangle.ffi/load-libraries!)
-  ;; (def api (triangle.wgpu/make-api))
-  ;; (def window (triangle.core/open-window! api))
+  ;; (def window (triangle.core/open-window!))
   ;; (triangle.probe/report! window)
   )
